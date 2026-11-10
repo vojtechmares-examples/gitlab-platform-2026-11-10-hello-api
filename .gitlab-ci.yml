@@ -1,0 +1,202 @@
+# Template: ASP.NET Core (.NET 10) REST API. Build, test with coverage, scan with Trivy, build a container image and push it
+# to the project's Container Registry. The deploy jobs stay dormant until the project is onboarded (README: "Deploying").
+#   build      restore (locked), compile, publish
+#   test       xUnit tests, code coverage (Cobertura + HTML report as artifacts)
+#   security   Trivy on the repository (NuGet dependencies, secrets) and, after the build, on the image
+#   package    docker build on the ASP.NET Core image from MCR, push to the registry
+#   staging    pull the image on the server with the deploy token, restart the unit   (automatic on main, when ENABLE_DEPLOY=true)
+#   production the same                                                                 (manual, when ENABLE_DEPLOY=true)
+
+include:
+  - project: examples/ci-templates
+    ref: main
+    file: /rocky.yml
+
+stages: [build, test, security, package, staging, production]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+variables:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+  NUGET_PACKAGES: "$CI_PROJECT_DIR/.nuget"
+  # Set to "true" in the project's CI/CD variables once the project is known to the Ansible project (README: "Deploying")
+  ENABLE_DEPLOY: "false"
+
+.dotnet:
+  image: mcr.microsoft.com/dotnet/sdk:10.0
+  cache:
+    key: nuget-$CI_PROJECT_NAME
+    paths: [.nuget/]
+
+build:
+  extends: .dotnet
+  stage: build
+  script:
+    - dotnet restore --locked-mode
+    - dotnet build -c Release --no-restore
+    - dotnet publish src/App/App.csproj -c Release --no-build -o publish
+  artifacts:
+    paths: [publish/]
+    expire_in: 1 week
+
+test:
+  extends: .dotnet
+  stage: test
+  needs: []
+  script:
+    - dotnet restore --locked-mode
+    - >
+      dotnet test -c Release --no-restore --settings coverlet.runsettings
+      --logger "junit;LogFilePath=$CI_PROJECT_DIR/TestResults/junit.xml"
+      --collect:"XPlat Code Coverage" --results-directory TestResults
+    - dotnet tool restore
+    - dotnet reportgenerator -reports:"TestResults/*/coverage.cobertura.xml" -targetdir:coverage -reporttypes:"TextSummary;Html;Cobertura"
+    - cat coverage/Summary.txt
+  coverage: '/Line coverage: (\d+\.?\d*)%/'
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths: [coverage/]
+    reports:
+      junit: TestResults/junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/Cobertura.xml
+
+.trivy:
+  image:
+    name: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/aquasec/trivy:0.76.2
+    entrypoint: [""]
+  variables:
+    TRIVY_CACHE_DIR: "$CI_PROJECT_DIR/.trivycache"
+    TRIVY_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
+    TRIVY_NO_PROGRESS: "true"
+  cache:
+    key: trivy
+    paths: [.trivycache/]
+
+trivy:repository:
+  extends: .trivy
+  stage: security
+  needs: []
+  script:
+    - trivy fs --scanners vuln,secret --severity HIGH,CRITICAL --format json --output trivy-repository.json .
+    - trivy convert --format table trivy-repository.json
+    - trivy convert --severity CRITICAL --exit-code 1 --format table trivy-repository.json > /dev/null
+  allow_failure: true
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths: [trivy-repository.json]
+
+build-image:
+  stage: package
+  needs: [build]
+  image: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/docker:29
+  services:
+    - name: $CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/docker:29-dind
+      alias: docker
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: "/certs/client"
+    BUILDX_NO_DEFAULT_ATTESTATIONS: "1"   # the GitLab 19.5 registry rejects Docker 29's attestation manifests
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - docker build --pull --build-arg BUILD_ID=$CI_PIPELINE_ID -t "$CI_REGISTRY_IMAGE:$CI_PIPELINE_ID" .
+    - docker push "$CI_REGISTRY_IMAGE:$CI_PIPELINE_ID"
+
+trivy:image:
+  extends: .trivy
+  stage: package
+  needs: [build-image]
+  variables:
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - trivy image --severity HIGH,CRITICAL --format json --output trivy-image.json "$CI_REGISTRY_IMAGE:$CI_PIPELINE_ID"
+    - trivy convert --format table trivy-image.json
+    - trivy convert --severity CRITICAL --exit-code 1 --format table trivy-image.json > /dev/null
+  allow_failure: true
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths: [trivy-image.json]
+
+.deploy:
+  image: rockylinux/rockylinux:10
+  resource_group: $CI_PROJECT_NAME-$DEPLOY_ENV
+  before_script:
+    - !reference [.rocky-dnf, before_script]
+    - dnf -y -q install openssh-clients curl
+    - !reference [.ssh-setup, before_script]
+  script:
+    - deploy/release.sh $DEPLOY_ENV
+
+deploy:staging:
+  extends: .deploy
+  stage: staging
+  needs: [build-image]
+  variables:
+    DEPLOY_ENV: staging
+  environment:
+    name: staging
+    url: https://$CI_PROJECT_NAME-staging.$EXAMPLES_DOMAIN
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $ENABLE_DEPLOY == "true"
+
+deploy:production:
+  extends: .deploy
+  stage: production
+  needs: [build-image, deploy:staging]
+  variables:
+    DEPLOY_ENV: production
+  environment:
+    name: production
+    url: https://$CI_PROJECT_NAME-production.$EXAMPLES_DOMAIN
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $ENABLE_DEPLOY == "true"
+      when: manual
+
+.rollback:
+  image: rockylinux/rockylinux:10
+  needs: []
+  before_script:
+    - !reference [.rocky-dnf, before_script]
+    - dnf -y -q install openssh-clients curl
+    - !reference [.ssh-setup, before_script]
+  script:
+    - deploy/rollback.sh $DEPLOY_ENV
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $ENABLE_DEPLOY == "true"
+      when: manual
+      allow_failure: true
+
+rollback:staging:
+  extends: .rollback
+  stage: staging
+  variables:
+    DEPLOY_ENV: staging
+  environment:
+    name: staging
+    action: access
+
+rollback:production:
+  extends: .rollback
+  stage: production
+  variables:
+    DEPLOY_ENV: production
+  environment:
+    name: production
+    action: access
