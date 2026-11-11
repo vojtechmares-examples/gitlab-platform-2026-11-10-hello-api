@@ -11,7 +11,7 @@ include:
   - project: examples/ci-templates
     ref: main
     file: /rocky.yml
-  - file: .gitlab/ci/trivy.yml
+  - local: .gitlab/ci/trivy.yml
 
 stages: [build, test, security, package, staging, production]
 
